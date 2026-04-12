@@ -1,0 +1,8 @@
+services:
+  - type: worker
+    name: speed-downloader-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
