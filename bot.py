@@ -143,11 +143,11 @@ def _download_video_sync(url, format_sel, output_dir, user_id=None, progress_dat
         "ignoreerrors": True,
         "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
         "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 5,
-        "file_access_retries": 5,
-        "extractor_retries": 5,
+        "socket_timeout": 120,
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 10,
+        "extractor_retries": 10,
         "overwrites": True,
         "noprogress": True,
         "postprocessors": [{
@@ -280,7 +280,7 @@ def build_format_selector(quality):
 
 def find_output_file(task_dir):
     """Find the largest media file in the output directory."""
-    media_exts = {'.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flac', '.opus', '.ogg', '.wav', '.aac', '.avi', '.mov'}
+    media_exts = {'.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flac', '.opus', '.ogg', '.wav', '.aac', '.avi', '.mov', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
     files = []
     for f in task_dir.iterdir():
         if f.is_file() and f.suffix.lower() in media_exts and f.stat().st_size > 0:
@@ -453,6 +453,9 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📉 480p Saver", callback_data=f"q_480p|{msg.message_id}"),
             InlineKeyboardButton("🎵 Audio MP3", callback_data=f"q_audio|{msg.message_id}"),
         ],
+        [
+            InlineKeyboardButton("🖼 Photo/Thumbnail", callback_data=f"q_photo|{msg.message_id}"),
+        ],
     ]
     await safe_edit(msg, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -585,6 +588,7 @@ async def do_music_search(update, query):
 async def do_download(bot, chat_id, user_id, url, quality, status_msg):
     """Execute the full download + send workflow."""
     is_audio = (quality == "audio")
+    is_photo = (quality == "photo")
     task_id = str(uuid.uuid4())[:8]
     task_dir = DOWNLOAD_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +607,41 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
 
         title = (info.get("title") or "download")[:60]
         duration = fmt_duration(info.get("duration"))
+
+        # Photo download: get thumbnail/image
+        if is_photo:
+            thumb_url = info.get("thumbnail") or info.get("thumbnails", [{}])[-1].get("url")
+            if not thumb_url:
+                await safe_edit(status_msg, f"❌ <b>No photo/thumbnail found for this URL.</b>\n\n{POWERED_BY}")
+                return
+            await safe_edit(status_msg, f"📥 <b>Downloading photo...</b>\n\n{POWERED_BY}")
+            import urllib.request
+            photo_path = task_dir / f"{title}.jpg"
+            try:
+                req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=30) as resp, open(photo_path, "wb") as out:
+                    out.write(resp.read())
+            except Exception as e:
+                await safe_edit(status_msg, f"❌ <b>Failed to download photo:</b> <code>{str(e)[:200]}</code>\n\n{POWERED_BY}")
+                return
+            caption = (
+                f"🖼 <b>Photo Downloaded!</b>\n\n"
+                f"📌 {title}\n\n"
+                f"{POWERED_BY}"
+            )
+            delivery_buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                [InlineKeyboardButton("👨\u200d💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+            ])
+            with open(photo_path, "rb") as fh:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=fh,
+                    caption=caption, parse_mode=ParseMode.HTML,
+                    reply_markup=delivery_buttons,
+                )
+            await safe_edit(status_msg, f"✅ <b>Photo sent!</b>\n\n{POWERED_BY}")
+            shutil.rmtree(task_dir, ignore_errors=True)
+            return
 
         # Step 2: Download with progress
         progress_data = {"pct": 0, "downloaded": 0, "total": 0, "speed": 0, "status": "downloading"}
@@ -761,17 +800,22 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
                     title=title, caption=caption,
                     parse_mode=ParseMode.HTML,
                     reply_markup=delivery_buttons,
-                    read_timeout=600, write_timeout=600,
+                    read_timeout=1200, write_timeout=1200,
                 )
-            elif file_size < 50_000_000 and ext in ('.mp4', '.mkv', '.webm', '.mov'):
+            elif ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'):
+                await bot.send_photo(
+                    chat_id=chat_id, photo=fh,
+                    caption=caption, parse_mode=ParseMode.HTML,
+                    read_timeout=1200, write_timeout=1200,
+                )
+            elif file_size < MAX_TG_FILE and ext in ('.mp4', '.mkv', '.webm', '.mov'):
                 try:
                     await bot.send_video(
                         chat_id=chat_id, video=fh,
                         caption=caption, parse_mode=ParseMode.HTML,
                         supports_streaming=True,
                         reply_markup=delivery_buttons,
-                        read_timeout=600, write_timeout=600,
-                    )
+                        read_timeout=1200, write_timeout=1200,               )
                 except Exception:
                     fh.seek(0)
                     await bot.send_document(
@@ -779,7 +823,7 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
                         filename=output_file.name, caption=caption,
                         parse_mode=ParseMode.HTML,
                         reply_markup=delivery_buttons,
-                        read_timeout=600, write_timeout=600,
+                        read_timeout=1200, write_timeout=1200,
                     )
             else:
                 await bot.send_document(
@@ -787,7 +831,7 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
                     filename=output_file.name, caption=caption,
                     parse_mode=ParseMode.HTML,
                     reply_markup=delivery_buttons,
-                    read_timeout=600, write_timeout=600,
+                    read_timeout=1200, write_timeout=1200,
                 )
 
         upload_time = time.time() - upload_start
@@ -862,6 +906,9 @@ async def show_quality_buttons(update, url):
         [
             InlineKeyboardButton("📉 480p Saver", callback_data=f"q_480p|{msg.message_id}"),
             InlineKeyboardButton("🎵 Audio MP3", callback_data=f"q_audio|{msg.message_id}"),
+        ],
+        [
+            InlineKeyboardButton("🖼 Photo/Thumbnail", callback_data=f"q_photo|{msg.message_id}"),
         ],
     ]
 
@@ -1041,7 +1088,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                 title=r["title"], caption=caption,
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=dl_buttons,
-                                read_timeout=600, write_timeout=600,
+                                read_timeout=1200, write_timeout=1200,
                             )
                     shutil.rmtree(task_dir, ignore_errors=True)
                 except Exception as e:
@@ -1183,7 +1230,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                 filename=output_file.name, caption=caption,
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=pl_buttons,
-                                read_timeout=600, write_timeout=600,
+                                read_timeout=1200, write_timeout=1200,
                             )
                 except Exception as e:
                     log.error(f"Playlist item {i} error: {e}")
@@ -1226,10 +1273,10 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(30)
-        .pool_timeout(30)
+        .read_timeout(1200)
+        .write_timeout(1200)
+        .connect_timeout(60)
+        .pool_timeout(60)
         .build()
     )
 
