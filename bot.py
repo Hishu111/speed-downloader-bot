@@ -411,6 +411,12 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(msg, f"❌ <b>Error:</b> Could not extract info.\n<code>{str(e)[:200]}</code>\n\n{POWERED_BY}")
         return
 
+    if not info:
+        await safe_edit(msg,
+            f"❌ <b>Error:</b> Could not extract info from this URL.\n"
+            f"The platform may require login or the link is invalid.\n\n{POWERED_BY}")
+        return
+
     title = info.get("title", "Unknown")
     duration = fmt_duration(info.get("duration"))
     formats = info.get("formats") or []
@@ -603,6 +609,12 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
             await safe_edit(status_msg,
                     f"❌ <b>Error:</b> Could not analyze URL.\n"
                     f"<code>{err[:300]}</code>\n\n{POWERED_BY}")
+            return
+
+        if not info:
+            await safe_edit(status_msg,
+                f"❌ <b>Error:</b> Could not extract info from this URL.\n"
+                f"The platform may require login or the link is invalid.\n\n{POWERED_BY}")
             return
 
         title = (info.get("title") or "download")[:60]
@@ -835,14 +847,27 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
                 )
 
         upload_time = time.time() - upload_start
-        completion_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
-            [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
-        ])
+
+        # After video download, offer to extract audio
+        if not is_audio and not is_photo and ext in ('.mp4', '.mkv', '.webm', '.mov', '.avi'):
+            # Store URL for audio extraction
+            audio_key = f"extract_audio_{status_msg.message_id}"
+            pending_urls[audio_key] = url
+            completion_buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 Extract Audio / Background Music", callback_data=f"ea_{status_msg.message_id}")],
+                [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+            ])
+        else:
+            completion_buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+            ])
         await safe_edit(status_msg,
             f"✅ <b>Task Completed!</b>\n"
             f"📂 {output_file.name}\n"
-            f"📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n{POWERED_BY}",
+            f"📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n"
+            f"🎵 <i>Want the audio/background music? Click below!</i>\n\n{POWERED_BY}" if not is_audio and not is_photo and ext in ('.mp4', '.mkv', '.webm', '.mov', '.avi') else f"✅ <b>Task Completed!</b>\n📂 {output_file.name}\n📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n{POWERED_BY}",
             reply_markup=completion_buttons)
 
     except Exception as e:
@@ -868,6 +893,12 @@ async def show_quality_buttons(update, url):
         await safe_edit(msg,
                 f"❌ <b>Error:</b> Could not analyze URL.\n"
                 f"<code>{err[:300]}</code>\n\n{POWERED_BY}")
+        return
+
+    if not info:
+        await safe_edit(msg,
+            f"❌ <b>Error:</b> Could not extract info from this URL.\n"
+            f"The platform may require login or the link is invalid.\n\n{POWERED_BY}")
         return
 
     title = (info.get("title") or "Unknown")[:60]
@@ -1178,6 +1209,62 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_settings[uid]["audio_bitrate"] = br
         await query.edit_message_text(f"✅ Audio bitrate set to: <b>{br}kbps</b>\n\n{POWERED_BY}",
             parse_mode=ParseMode.HTML)
+        return
+
+    # Extract audio from video
+    if data.startswith("ea_"):
+        msg_id = data.replace("ea_", "")
+        audio_key = f"extract_audio_{msg_id}"
+        url = pending_urls.get(audio_key)
+        if not url:
+            await safe_edit(query.message, f"❌ Session expired. Please send the link again.\n\n{POWERED_BY}")
+            return
+
+        await safe_edit(query.message,
+            f"🎵 <b>Extracting audio/background music...</b>\n\n{POWERED_BY}")
+
+        task_dir = DOWNLOAD_DIR / str(uuid.uuid4())[:8]
+        task_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            loop = asyncio.get_event_loop()
+            s = user_settings[uid]
+            await loop.run_in_executor(
+                None, _download_audio_sync,
+                url, s["audio_format"], s["audio_bitrate"],
+                task_dir, uid, None
+            )
+            output_file = find_output_file(task_dir)
+            if output_file:
+                file_size = output_file.stat().st_size
+                caption = (
+                    f"🎵 <b>Audio Extracted!</b>\n\n"
+                    f"📂 {output_file.name}\n"
+                    f"📦 Size: <code>{fmt_size(file_size)}</code>\n\n"
+                    f"{POWERED_BY}"
+                )
+                dl_buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                    [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+                ])
+                with open(output_file, "rb") as fh:
+                    await bot.send_audio(
+                        chat_id=chat_id, audio=fh,
+                        title=output_file.stem, caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=dl_buttons,
+                        read_timeout=1200, write_timeout=1200,
+                    )
+                await safe_edit(query.message,
+                    f"✅ <b>Audio extracted and sent!</b>\n\n{POWERED_BY}")
+            else:
+                await safe_edit(query.message,
+                    f"❌ <b>Could not extract audio.</b>\n\n{POWERED_BY}")
+        except Exception as e:
+            log.error(f"Audio extraction error: {e}")
+            await safe_edit(query.message,
+                f"❌ <b>Audio extraction failed:</b> <code>{str(e)[:200]}</code>\n\n{POWERED_BY}")
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
         return
 
     # Playlist download
