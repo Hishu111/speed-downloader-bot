@@ -31,7 +31,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 
 # ── Config ──────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8707229530:AAHqUWiWy_ja7dUIrE7HmUxSRbB549w5lYM")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8043941196:AAEOiKxtEqUoyDkwHX8plH1R3OW4SrLFa-U")
 BOT_NAME = "SPEED DOWNLOADER"
 CREATOR = "@SPEED_prime"
 CHANNEL = "@SPEED_AI_COMMUNITY"
@@ -848,13 +848,84 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
 
         upload_time = time.time() - upload_start
 
-        # After video download, offer to extract audio
+        # After video download, identify the background music used
         if not is_audio and not is_photo and ext in ('.mp4', '.mkv', '.webm', '.mov', '.avi'):
-            # Store URL for audio extraction
-            audio_key = f"extract_audio_{status_msg.message_id}"
-            pending_urls[audio_key] = url
+            # Try to identify the real song/music used in the video
+            track_name = info.get("track") or info.get("alt_title") or ""
+            artist_name = info.get("artist") or info.get("creator") or ""
+            album_name = info.get("album") or ""
+            music_url = info.get("track_url") or ""
+
+            # Build search query from metadata
+            if track_name and artist_name:
+                music_query = f"{artist_name} - {track_name}"
+            elif track_name:
+                music_query = track_name
+            elif artist_name:
+                music_query = artist_name
+            else:
+                # Try to extract from title (many TikTok/IG videos have "artist - song" in title)
+                music_query = ""
+
+            if music_query:
+                # Search for the real song on YouTube
+                try:
+                    music_results = await search_music(music_query, max_results=5)
+                except Exception:
+                    music_results = []
+
+                if music_results:
+                    # Store results for callback
+                    bg_key = f"bg_{status_msg.message_id}"
+                    music_search_results[bg_key] = music_results
+
+                    # Get thumbnail/cover art URL
+                    thumb_url = info.get("thumbnail") or ""
+
+                    # Build song info text
+                    song_info = f"🎵 <b>Background Music Detected!</b>\n\n"
+                    if artist_name:
+                        song_info += f"🎤 Artist: <b>{artist_name}</b>\n"
+                    if track_name:
+                        song_info += f"🎶 Track: <b>{track_name}</b>\n"
+                    if album_name:
+                        song_info += f"💿 Album: <b>{album_name}</b>\n"
+                    song_info += f"\n🔎 Found {len(music_results)} results:\n"
+                    for i, r in enumerate(music_results):
+                        song_info += f"  {i+1}. <b>{r['title']}</b> — {r['channel']} ({r['duration']})\n"
+
+                    # Build buttons for each result
+                    buttons = []
+                    for i, r in enumerate(music_results):
+                        buttons.append([InlineKeyboardButton(
+                            f"🎵 {i+1}. {r['title'][:40]}",
+                            callback_data=f"bg_audio_{i}|{bg_key}"
+                        )])
+                    buttons.append([InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")])
+                    buttons.append([InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")])
+
+                    # Send cover art photo if available
+                    if thumb_url:
+                        try:
+                            await bot.send_photo(
+                                chat_id=chat_id, photo=thumb_url,
+                                caption=song_info, parse_mode=ParseMode.HTML,
+                                reply_markup=InlineKeyboardMarkup(buttons),
+                            )
+                        except Exception:
+                            await bot.send_message(
+                                chat_id=chat_id, text=song_info,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=InlineKeyboardMarkup(buttons),
+                            )
+                    else:
+                        await bot.send_message(
+                            chat_id=chat_id, text=song_info,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup(buttons),
+                        )
+
             completion_buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎵 Extract Audio / Background Music", callback_data=f"ea_{status_msg.message_id}")],
                 [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
                 [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
             ])
@@ -866,8 +937,7 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
         await safe_edit(status_msg,
             f"✅ <b>Task Completed!</b>\n"
             f"📂 {output_file.name}\n"
-            f"📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n"
-            f"🎵 <i>Want the audio/background music? Click below!</i>\n\n{POWERED_BY}" if not is_audio and not is_photo and ext in ('.mp4', '.mkv', '.webm', '.mov', '.avi') else f"✅ <b>Task Completed!</b>\n📂 {output_file.name}\n📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n{POWERED_BY}",
+            f"📦 {fmt_size(file_size)} | ⏱ Upload: {upload_time:.1f}s\n\n{POWERED_BY}",
             reply_markup=completion_buttons)
 
     except Exception as e:
@@ -1211,17 +1281,29 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
 
-    # Extract audio from video
-    if data.startswith("ea_"):
-        msg_id = data.replace("ea_", "")
-        audio_key = f"extract_audio_{msg_id}"
-        url = pending_urls.get(audio_key)
-        if not url:
+    # Download background music from video
+    if data.startswith("bg_audio_"):
+        parts = data.split("|", 1)
+        action = parts[0]
+        bg_key = parts[1] if len(parts) > 1 else ""
+
+        results = music_search_results.get(bg_key)
+        if not results:
             await safe_edit(query.message, f"❌ Session expired. Please send the link again.\n\n{POWERED_BY}")
             return
 
+        try:
+            idx = int(action.replace("bg_audio_", ""))
+        except:
+            return
+
+        if idx >= len(results):
+            return
+
+        r = results[idx]
         await safe_edit(query.message,
-            f"🎵 <b>Extracting audio/background music...</b>\n\n{POWERED_BY}")
+            f"🎵 <b>Downloading:</b> {r['title']}\n"
+            f"🎤 {r['channel']}\n\n{POWERED_BY}")
 
         task_dir = DOWNLOAD_DIR / str(uuid.uuid4())[:8]
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -1230,15 +1312,16 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s = user_settings[uid]
             await loop.run_in_executor(
                 None, _download_audio_sync,
-                url, s["audio_format"], s["audio_bitrate"],
+                r["url"], s["audio_format"], s["audio_bitrate"],
                 task_dir, uid, None
             )
             output_file = find_output_file(task_dir)
             if output_file:
                 file_size = output_file.stat().st_size
                 caption = (
-                    f"🎵 <b>Audio Extracted!</b>\n\n"
-                    f"📂 {output_file.name}\n"
+                    f"🎵 <b>Background Music Downloaded!</b>\n\n"
+                    f"🎶 {r['title']}\n"
+                    f"🎤 {r['channel']}\n"
                     f"📦 Size: <code>{fmt_size(file_size)}</code>\n\n"
                     f"{POWERED_BY}"
                 )
@@ -1249,20 +1332,21 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 with open(output_file, "rb") as fh:
                     await bot.send_audio(
                         chat_id=chat_id, audio=fh,
-                        title=output_file.stem, caption=caption,
+                        title=r['title'], caption=caption,
                         parse_mode=ParseMode.HTML,
                         reply_markup=dl_buttons,
                         read_timeout=1200, write_timeout=1200,
                     )
                 await safe_edit(query.message,
-                    f"✅ <b>Audio extracted and sent!</b>\n\n{POWERED_BY}")
+                    f"✅ <b>Background music sent!</b>\n"
+                    f"🎶 {r['title']} — {r['channel']}\n\n{POWERED_BY}")
             else:
                 await safe_edit(query.message,
-                    f"❌ <b>Could not extract audio.</b>\n\n{POWERED_BY}")
+                    f"❌ <b>Could not download this track.</b>\n\n{POWERED_BY}")
         except Exception as e:
-            log.error(f"Audio extraction error: {e}")
+            log.error(f"BG music download error: {e}")
             await safe_edit(query.message,
-                f"❌ <b>Audio extraction failed:</b> <code>{str(e)[:200]}</code>\n\n{POWERED_BY}")
+                f"❌ <b>Download failed:</b> <code>{str(e)[:200]}</code>\n\n{POWERED_BY}")
         finally:
             shutil.rmtree(task_dir, ignore_errors=True)
         return
@@ -1353,6 +1437,25 @@ async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await do_music_search(update, query)
 
 
+# ── Register bot commands in Telegram menu ─────────────────
+async def post_init(application):
+    """Register all bot commands in Telegram menu so users see them when typing /"""
+    commands = [
+        BotCommand("start", "Start the bot and see welcome message"),
+        BotCommand("help", "Show all available commands and usage"),
+        BotCommand("download", "Download video/audio from any URL"),
+        BotCommand("video", "Download video from URL"),
+        BotCommand("audio", "Download audio from URL"),
+        BotCommand("music", "Search and download music by name"),
+        BotCommand("playlist", "Download entire playlist"),
+        BotCommand("info", "Get media info from URL"),
+        BotCommand("settings", "Customize your download preferences"),
+        BotCommand("subs", "Download subtitles from URL"),
+        BotCommand("ping", "Check if bot is online"),
+    ]
+    await application.bot.set_my_commands(commands)
+    log.info("Bot commands registered in Telegram menu.")
+
 # ── Main ────────────────────────────────────────────────────
 def main():
     log.info("Starting SPEED DOWNLOADER bot...")
@@ -1364,6 +1467,7 @@ def main():
         .write_timeout(1200)
         .connect_timeout(60)
         .pool_timeout(60)
+        .post_init(post_init)
         .build()
     )
 
