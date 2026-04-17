@@ -15,6 +15,7 @@ import logging
 import uuid
 import shutil
 import traceback
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -64,6 +65,12 @@ pending_urls = {}  # msg_id -> url
 
 # Store music search results
 music_search_results = {}  # msg_id -> list of results
+
+# Store edit sessions
+edit_sessions = {}  # user_id -> {"action": ..., "waiting_for": ..., "params": ...}
+
+# Store video info for background song button
+pending_video_info = {}  # msg_id -> {"url": ..., "info": ...}
 
 # ── URL detection ───────────────────────────────────────────
 URL_REGEX = re.compile(
@@ -345,6 +352,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  <i>resolution: 8k, 4k, 1080p, 720p, 480p</i>\n\n"
         "<code>/playlist &lt;url&gt;</code> — Download playlist\n\n"
         "<code>/subs &lt;url&gt; [lang]</code> — Download subtitles\n\n"
+        "<code>/edit</code> — Edit videos (reply to video with /edit)\n\n"
         "<code>/settings</code> — View/change preferences\n\n"
         "<code>/ping</code> — Check bot latency\n\n"
         "🎵 <b>Music Search:</b>\n"
@@ -848,13 +856,11 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
 
         upload_time = time.time() - upload_start
 
-        # After video download, identify the background music used
+        # After video download, check for background music and offer download button
         if not is_audio and not is_photo and ext in ('.mp4', '.mkv', '.webm', '.mov', '.avi'):
-            # Try to identify the real song/music used in the video
             track_name = info.get("track") or info.get("alt_title") or ""
             artist_name = info.get("artist") or info.get("creator") or ""
             album_name = info.get("album") or ""
-            music_url = info.get("track_url") or ""
 
             # Build search query from metadata
             if track_name and artist_name:
@@ -864,71 +870,30 @@ async def do_download(bot, chat_id, user_id, url, quality, status_msg):
             elif artist_name:
                 music_query = artist_name
             else:
-                # Try to extract from title (many TikTok/IG videos have "artist - song" in title)
                 music_query = ""
 
             if music_query:
-                # Search for the real song on YouTube
-                try:
-                    music_results = await search_music(music_query, max_results=5)
-                except Exception:
-                    music_results = []
-
-                if music_results:
-                    # Store results for callback
-                    bg_key = f"bg_{status_msg.message_id}"
-                    music_search_results[bg_key] = music_results
-
-                    # Get thumbnail/cover art URL
-                    thumb_url = info.get("thumbnail") or ""
-
-                    # Build song info text
-                    song_info = f"🎵 <b>Background Music Detected!</b>\n\n"
-                    if artist_name:
-                        song_info += f"🎤 Artist: <b>{artist_name}</b>\n"
-                    if track_name:
-                        song_info += f"🎶 Track: <b>{track_name}</b>\n"
-                    if album_name:
-                        song_info += f"💿 Album: <b>{album_name}</b>\n"
-                    song_info += f"\n🔎 Found {len(music_results)} results:\n"
-                    for i, r in enumerate(music_results):
-                        song_info += f"  {i+1}. <b>{r['title']}</b> — {r['channel']} ({r['duration']})\n"
-
-                    # Build buttons for each result
-                    buttons = []
-                    for i, r in enumerate(music_results):
-                        buttons.append([InlineKeyboardButton(
-                            f"🎵 {i+1}. {r['title'][:40]}",
-                            callback_data=f"bg_audio_{i}|{bg_key}"
-                        )])
-                    buttons.append([InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")])
-                    buttons.append([InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")])
-
-                    # Send cover art photo if available
-                    if thumb_url:
-                        try:
-                            await bot.send_photo(
-                                chat_id=chat_id, photo=thumb_url,
-                                caption=song_info, parse_mode=ParseMode.HTML,
-                                reply_markup=InlineKeyboardMarkup(buttons),
-                            )
-                        except Exception:
-                            await bot.send_message(
-                                chat_id=chat_id, text=song_info,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=InlineKeyboardMarkup(buttons),
-                            )
-                    else:
-                        await bot.send_message(
-                            chat_id=chat_id, text=song_info,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=InlineKeyboardMarkup(buttons),
-                        )
-
-            completion_buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
-                [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
-            ])
+                # Store info for later when user clicks the button
+                song_key = f"song_{status_msg.message_id}"
+                pending_video_info[song_key] = {
+                    "url": url,
+                    "query": music_query,
+                    "track": track_name,
+                    "artist": artist_name,
+                    "album": album_name,
+                    "thumbnail": info.get("thumbnail") or "",
+                }
+                song_label = f"{artist_name} - {track_name}" if artist_name and track_name else music_query
+                completion_buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"🎵 Download Song: {song_label[:45]}", callback_data=f"findsong|{song_key}")],
+                    [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                    [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+                ])
+            else:
+                completion_buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                    [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+                ])
         else:
             completion_buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
@@ -1281,6 +1246,197 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
 
+    # Video edit callbacks
+    if data.startswith("edit_"):
+        action = data.replace("edit_", "")
+        session = edit_sessions.get(uid)
+        if not session:
+            await safe_edit(query.message, f"❌ No edit session. Reply to a video with /edit first.\n\n{POWERED_BY}")
+            return
+
+        session["action"] = action
+
+        # Actions that need user input
+        if action == "trim":
+            session["waiting_for"] = "trim_times"
+            await safe_edit(query.message,
+                "✂️ <b>Trim Video</b>\n\n"
+                "Send start and end time separated by space:\n"
+                "<code>00:00:10 00:00:30</code>\n"
+                "or in seconds: <code>10 30</code>\n\n" + POWERED_BY)
+            return
+
+        elif action == "speed":
+            session["waiting_for"] = "speed_value"
+            await safe_edit(query.message,
+                "⏩ <b>Change Speed</b>\n\n"
+                "Send speed value (0.25 to 4.0):\n"
+                "<code>0.5</code> = slow-mo\n"
+                "<code>1.0</code> = normal\n"
+                "<code>2.0</code> = 2x fast\n\n" + POWERED_BY)
+            return
+
+        elif action == "text":
+            session["waiting_for"] = "text_content"
+            await safe_edit(query.message,
+                "📝 <b>Add Text / Watermark</b>\n\n"
+                "Send the text you want to add on the video:\n\n" + POWERED_BY)
+            return
+
+        elif action == "music":
+            session["waiting_for"] = "music_file"
+            await safe_edit(query.message,
+                "🎵 <b>Add Background Music</b>\n\n"
+                "Send an audio file (MP3, M4A, etc.) to add as background music:\n\n" + POWERED_BY)
+            return
+
+        elif action == "resize":
+            session["waiting_for"] = "resize_value"
+            await safe_edit(query.message,
+                "📐 <b>Resize Video</b>\n\n"
+                "Send the new size:\n"
+                "<code>1920x1080</code> (Full HD)\n"
+                "<code>1280x720</code> (HD)\n"
+                "<code>640x360</code> (SD)\n\n" + POWERED_BY)
+            return
+
+        elif action == "convert":
+            buttons = [
+                [InlineKeyboardButton("MP4", callback_data="editfmt_mp4"),
+                 InlineKeyboardButton("MKV", callback_data="editfmt_mkv")],
+                [InlineKeyboardButton("AVI", callback_data="editfmt_avi"),
+                 InlineKeyboardButton("WEBM", callback_data="editfmt_webm")],
+                [InlineKeyboardButton("MOV", callback_data="editfmt_mov")],
+            ]
+            await safe_edit(query.message, "🔄 <b>Choose output format:</b>\n\n" + POWERED_BY,
+                reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        elif action == "filter":
+            buttons = [
+                [InlineKeyboardButton("🖤 Grayscale", callback_data="editflt_grayscale"),
+                 InlineKeyboardButton("🌫 Blur", callback_data="editflt_blur")],
+                [InlineKeyboardButton("🔪 Sharpen", callback_data="editflt_sharpen"),
+                 InlineKeyboardButton("☀️ Bright", callback_data="editflt_bright")],
+                [InlineKeyboardButton("🌗 Contrast", callback_data="editflt_contrast"),
+                 InlineKeyboardButton("📼 Vintage", callback_data="editflt_vintage")],
+                [InlineKeyboardButton("🔃 Negative", callback_data="editflt_negative"),
+                 InlineKeyboardButton("🪞 Mirror", callback_data="editflt_mirror")],
+                [InlineKeyboardButton("↕️ Flip", callback_data="editflt_flip")],
+            ]
+            await safe_edit(query.message, "🎨 <b>Choose a filter:</b>\n\n" + POWERED_BY,
+                reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        # Actions that process immediately (no extra input needed)
+        elif action in ("mute", "compress", "gif", "reverse", "screenshot"):
+            status = query.message
+            await safe_edit(status, f"⚙️ <b>Processing: {EDIT_FEATURES.get(action, action)}...</b>\n\n{POWERED_BY}")
+            await process_edit(bot, chat_id, uid, session, status)
+            return
+
+        elif action == "merge":
+            await safe_edit(query.message,
+                "🔗 <b>Merge Videos</b>\n\n"
+                "To merge videos, send all videos first, then reply to each one with /edit and choose an action.\n"
+                "Merge feature coming soon!\n\n" + POWERED_BY)
+            return
+
+        return
+
+    # Edit format selection
+    if data.startswith("editfmt_"):
+        fmt = data.replace("editfmt_", "")
+        session = edit_sessions.get(uid)
+        if not session:
+            await safe_edit(query.message, f"❌ No edit session.\n\n{POWERED_BY}")
+            return
+        session["params"]["format"] = fmt
+        session["waiting_for"] = None
+        await safe_edit(query.message, f"🔄 <b>Converting to {fmt.upper()}...</b>\n\n{POWERED_BY}")
+        await process_edit(bot, chat_id, uid, session, query.message)
+        return
+
+    # Edit filter selection
+    if data.startswith("editflt_"):
+        filt = data.replace("editflt_", "")
+        session = edit_sessions.get(uid)
+        if not session:
+            await safe_edit(query.message, f"❌ No edit session.\n\n{POWERED_BY}")
+            return
+        session["params"]["filter"] = filt
+        session["waiting_for"] = None
+        await safe_edit(query.message, f"🎨 <b>Applying filter...</b>\n\n{POWERED_BY}")
+        await process_edit(bot, chat_id, uid, session, query.message)
+        return
+
+    # Find song button clicked — search and show results
+    if data.startswith("findsong|"):
+        song_key = data.split("|", 1)[1]
+        song_data = pending_video_info.get(song_key)
+        if not song_data:
+            await safe_edit(query.message, f"❌ Session expired. Please send the link again.\n\n{POWERED_BY}")
+            return
+
+        await safe_edit(query.message,
+            f"🔍 <b>Searching for background music...</b>\n"
+            f"🎵 {song_data['query']}\n\n{POWERED_BY}")
+
+        try:
+            music_results = await search_music(song_data['query'], max_results=5)
+        except Exception:
+            music_results = []
+
+        if not music_results:
+            await safe_edit(query.message,
+                f"❌ <b>Could not find the song.</b>\n\n{POWERED_BY}")
+            return
+
+        # Store results for download callback
+        bg_key = f"bg_{query.message.message_id}"
+        music_search_results[bg_key] = music_results
+
+        # Build song info text
+        song_info = f"🎵 <b>Background Music Found!</b>\n\n"
+        if song_data.get('artist'):
+            song_info += f"🎤 Artist: <b>{song_data['artist']}</b>\n"
+        if song_data.get('track'):
+            song_info += f"🎶 Track: <b>{song_data['track']}</b>\n"
+        if song_data.get('album'):
+            song_info += f"💿 Album: <b>{song_data['album']}</b>\n"
+        song_info += f"\n🔎 Found {len(music_results)} results:\n"
+        for i, r in enumerate(music_results):
+            song_info += f"  {i+1}. <b>{r['title']}</b> — {r['channel']} ({r['duration']})\n"
+
+        # Build buttons
+        buttons = []
+        for i, r in enumerate(music_results):
+            buttons.append([InlineKeyboardButton(
+                f"🎵 {i+1}. {r['title'][:40]}",
+                callback_data=f"bg_audio_{i}|{bg_key}"
+            )])
+        buttons.append([InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")])
+        buttons.append([InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")])
+
+        # Send with cover art if available
+        thumb_url = song_data.get('thumbnail', '')
+        if thumb_url:
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=thumb_url,
+                    caption=song_info, parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+                await safe_edit(query.message,
+                    f"✅ <b>Song results sent above!</b>\n\n{POWERED_BY}")
+            except Exception:
+                await safe_edit(query.message, song_info,
+                    reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await safe_edit(query.message, song_info,
+                reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     # Download background music from video
     if data.startswith("bg_audio_"):
         parts = data.split("|", 1)
@@ -1416,6 +1572,13 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Auto-detect URLs or music search in messages ──────────
 async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Check if user is in an edit session waiting for text input
+    uid = update.effective_user.id
+    if uid in edit_sessions and edit_sessions[uid].get("waiting_for"):
+        handled = await handle_edit_text_input(update, ctx)
+        if handled:
+            return
+
     # In groups, only respond to URLs, not music search
     if update.effective_chat.type in ("group", "supergroup"):
         text = update.message.text or ""
@@ -1437,6 +1600,329 @@ async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await do_music_search(update, query)
 
 
+# ── /edit command ───────────────────────────────────────────
+EDIT_FEATURES = {
+    "trim": "✂️ Trim / Cut Video",
+    "speed": "⏩ Change Speed",
+    "text": "📝 Add Text / Watermark",
+    "music": "🎵 Add Background Music",
+    "mute": "🔇 Remove Audio",
+    "compress": "📦 Compress Video",
+    "convert": "🔄 Convert Format",
+    "resize": "📐 Resize / Crop",
+    "filter": "🎨 Add Filters",
+    "gif": "🎬 Create GIF",
+    "reverse": "⏪ Reverse Video",
+    "screenshot": "📸 Extract Screenshots",
+    "merge": "🔗 Merge Videos",
+}
+
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show video editing menu. User should reply to a video with /edit."""
+    msg = update.message
+    uid = update.effective_user.id
+
+    # Check if replying to a video
+    reply = msg.reply_to_message
+    if not reply or not (reply.video or reply.document or reply.animation):
+        await msg.reply_text(
+            "🎬 <b>Video Editor</b>\n\n"
+            "To edit a video, reply to a video message with /edit\n\n"
+            "<b>Available features:</b>\n"
+            "✂️ Trim / Cut\n"
+            "⏩ Change Speed (slow-mo, fast)\n"
+            "📝 Add Text / Watermark\n"
+            "🎵 Add Background Music\n"
+            "🔇 Remove Audio\n"
+            "📦 Compress Video\n"
+            "🔄 Convert Format\n"
+            "📐 Resize / Crop\n"
+            "🎨 Add Filters\n"
+            "🎬 Create GIF\n"
+            "⏪ Reverse Video\n"
+            "📸 Extract Screenshots\n"
+            "🔗 Merge Videos\n\n"
+            f"{POWERED_BY}",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # Store the file_id for later processing
+    if reply.video:
+        file_id = reply.video.file_id
+    elif reply.animation:
+        file_id = reply.animation.file_id
+    elif reply.document:
+        file_id = reply.document.file_id
+    else:
+        await msg.reply_text("❌ Please reply to a video file.\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        return
+
+    edit_sessions[uid] = {"file_id": file_id, "action": None, "waiting_for": None, "params": {}}
+
+    buttons = []
+    row = []
+    for i, (key, label) in enumerate(EDIT_FEATURES.items()):
+        row.append(InlineKeyboardButton(label, callback_data=f"edit_{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    await msg.reply_text(
+        "🎬 <b>Video Editor</b>\n\n"
+        "Choose an editing feature:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def handle_edit_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle video/document messages when user is in an edit session waiting for input."""
+    uid = update.effective_user.id
+    session = edit_sessions.get(uid)
+    if not session or session.get("waiting_for") != "music_file":
+        return
+
+    msg = update.message
+    if msg.audio or msg.voice:
+        file_id = (msg.audio or msg.voice).file_id
+    elif msg.document:
+        file_id = msg.document.file_id
+    else:
+        await msg.reply_text("❌ Please send an audio file.\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        return
+
+    session["params"]["music_file_id"] = file_id
+    session["waiting_for"] = None
+
+    status = await msg.reply_text("🎵 <b>Adding background music...</b>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+    await process_edit(ctx.bot, update.effective_chat.id, uid, session, status)
+
+
+async def handle_edit_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for edit sessions (trim times, speed, text, etc)."""
+    uid = update.effective_user.id
+    session = edit_sessions.get(uid)
+    if not session or not session.get("waiting_for"):
+        return False  # Not in edit mode
+
+    text = (update.message.text or "").strip()
+    waiting = session["waiting_for"]
+
+    if waiting == "trim_times":
+        # Expected: "00:00:10 00:00:30" or "10 30"
+        parts = text.split()
+        if len(parts) != 2:
+            await update.message.reply_text("❌ Send start and end time separated by space.\nExample: <code>00:00:10 00:00:30</code> or <code>10 30</code>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+            return True
+        session["params"]["start"] = parts[0]
+        session["params"]["end"] = parts[1]
+        session["waiting_for"] = None
+        status = await update.message.reply_text("✂️ <b>Trimming video...</b>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        await process_edit(ctx.bot, update.effective_chat.id, uid, session, status)
+        return True
+
+    elif waiting == "speed_value":
+        try:
+            speed = float(text)
+            if speed < 0.25 or speed > 4.0:
+                raise ValueError
+        except:
+            await update.message.reply_text("❌ Send a speed between 0.25 and 4.0\nExample: <code>0.5</code> (slow-mo) or <code>2.0</code> (fast)\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+            return True
+        session["params"]["speed"] = speed
+        session["waiting_for"] = None
+        status = await update.message.reply_text("⏩ <b>Changing video speed...</b>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        await process_edit(ctx.bot, update.effective_chat.id, uid, session, status)
+        return True
+
+    elif waiting == "text_content":
+        session["params"]["text"] = text
+        session["waiting_for"] = None
+        status = await update.message.reply_text("📝 <b>Adding text overlay...</b>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        await process_edit(ctx.bot, update.effective_chat.id, uid, session, status)
+        return True
+
+    elif waiting == "resize_value":
+        session["params"]["size"] = text
+        session["waiting_for"] = None
+        status = await update.message.reply_text("📐 <b>Resizing video...</b>\n\n" + POWERED_BY, parse_mode=ParseMode.HTML)
+        await process_edit(ctx.bot, update.effective_chat.id, uid, session, status)
+        return True
+
+    return False
+
+
+async def process_edit(bot, chat_id, uid, session, status_msg):
+    """Process the video edit using FFmpeg."""
+    action = session["action"]
+    params = session["params"]
+    file_id = session["file_id"]
+
+    task_dir = DOWNLOAD_DIR / str(uuid.uuid4())[:8]
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Download the video from Telegram
+        await safe_edit(status_msg, f"📥 <b>Downloading video from Telegram...</b>\n\n{POWERED_BY}")
+        tg_file = await bot.get_file(file_id)
+        input_path = task_dir / "input_video.mp4"
+        await tg_file.download_to_drive(str(input_path))
+
+        output_path = task_dir / "output.mp4"
+        ffmpeg = FFMPEG_PATH
+
+        await safe_edit(status_msg, f"⚙️ <b>Processing: {EDIT_FEATURES.get(action, action)}...</b>\n\n{POWERED_BY}")
+
+        loop = asyncio.get_event_loop()
+
+        if action == "trim":
+            start = params.get("start", "0")
+            end = params.get("end", "10")
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-ss", start, "-to", end, "-c", "copy", str(output_path)]
+
+        elif action == "speed":
+            speed = params.get("speed", 1.0)
+            video_filter = f"setpts={1/speed}*PTS"
+            audio_filter = f"atempo={speed}" if 0.5 <= speed <= 2.0 else f"atempo={min(2.0, speed)},atempo={speed/2.0}" if speed > 2.0 else f"atempo={max(0.5, speed)}"
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-filter:v", video_filter, "-filter:a", audio_filter, str(output_path)]
+
+        elif action == "text":
+            text = params.get("text", "SPEED AI")
+            # Escape special chars for FFmpeg drawtext
+            text_escaped = text.replace("'", "\\'").replace(":", "\\:")
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf",
+                   f"drawtext=text='{text_escaped}':fontsize=36:fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-th-20",
+                   "-codec:a", "copy", str(output_path)]
+
+        elif action == "music":
+            music_file_id = params.get("music_file_id")
+            if not music_file_id:
+                await safe_edit(status_msg, f"❌ No audio file provided.\n\n{POWERED_BY}")
+                return
+            music_file = await bot.get_file(music_file_id)
+            music_path = task_dir / "bg_music.mp3"
+            await music_file.download_to_drive(str(music_path))
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-i", str(music_path),
+                   "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2",
+                   "-c:v", "copy", str(output_path)]
+
+        elif action == "mute":
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-an", "-c:v", "copy", str(output_path)]
+
+        elif action == "compress":
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vcodec", "libx264", "-crf", "28",
+                   "-preset", "fast", "-acodec", "aac", "-b:a", "128k", str(output_path)]
+
+        elif action == "convert":
+            fmt = params.get("format", "mp4")
+            output_path = task_dir / f"output.{fmt}"
+            cmd = [ffmpeg, "-y", "-i", str(input_path), str(output_path)]
+
+        elif action == "resize":
+            size = params.get("size", "1280x720")
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf", f"scale={size.replace('x', ':')}",
+                   "-c:a", "copy", str(output_path)]
+
+        elif action == "filter":
+            filt = params.get("filter", "grayscale")
+            filter_map = {
+                "grayscale": "colorchannelmixer=.3:.4:.3:0:.3:.4:.3:0:.3:.4:.3",
+                "blur": "boxblur=5:1",
+                "sharpen": "unsharp=5:5:1.0:5:5:0.0",
+                "bright": "eq=brightness=0.1",
+                "contrast": "eq=contrast=1.5",
+                "vintage": "curves=vintage",
+                "negative": "negate",
+                "mirror": "hflip",
+                "flip": "vflip",
+            }
+            vf = filter_map.get(filt, filt)
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf", vf, "-c:a", "copy", str(output_path)]
+
+        elif action == "gif":
+            output_path = task_dir / "output.gif"
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf", "fps=15,scale=480:-1:flags=lanczos",
+                   "-t", "10", str(output_path)]
+
+        elif action == "reverse":
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf", "reverse", "-af", "areverse", str(output_path)]
+
+        elif action == "screenshot":
+            output_path = task_dir / "frame_%03d.jpg"
+            cmd = [ffmpeg, "-y", "-i", str(input_path), "-vf", "fps=1", "-frames:v", "5", str(output_path)]
+
+        else:
+            await safe_edit(status_msg, f"❌ Unknown edit action.\n\n{POWERED_BY}")
+            return
+
+        # Run FFmpeg
+        result = await loop.run_in_executor(None, lambda: subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600
+        ))
+
+        if result.returncode != 0:
+            err = result.stderr[:300] if result.stderr else "Unknown error"
+            await safe_edit(status_msg, f"❌ <b>FFmpeg error:</b>\n<code>{err}</code>\n\n{POWERED_BY}")
+            return
+
+        # Send result
+        if action == "screenshot":
+            # Send all extracted frames
+            frames = sorted(task_dir.glob("frame_*.jpg"))
+            if not frames:
+                await safe_edit(status_msg, f"❌ No frames extracted.\n\n{POWERED_BY}")
+                return
+            for frame in frames[:5]:
+                with open(frame, "rb") as fh:
+                    await bot.send_photo(chat_id=chat_id, photo=fh,
+                        caption=f"📸 {frame.name}\n\n{POWERED_BY}", parse_mode=ParseMode.HTML)
+            await safe_edit(status_msg, f"✅ <b>{len(frames)} screenshots extracted!</b>\n\n{POWERED_BY}")
+        elif action == "gif":
+            if output_path.exists() and output_path.stat().st_size > 0:
+                with open(output_path, "rb") as fh:
+                    await bot.send_animation(chat_id=chat_id, animation=fh,
+                        caption=f"🎬 <b>GIF Created!</b>\n\n{POWERED_BY}", parse_mode=ParseMode.HTML,
+                        read_timeout=1200, write_timeout=1200)
+                await safe_edit(status_msg, f"✅ <b>GIF created and sent!</b>\n\n{POWERED_BY}")
+            else:
+                await safe_edit(status_msg, f"❌ Failed to create GIF.\n\n{POWERED_BY}")
+        else:
+            if output_path.exists() and output_path.stat().st_size > 0:
+                file_size = output_path.stat().st_size
+                caption = (
+                    f"✅ <b>{EDIT_FEATURES.get(action, action)} Complete!</b>\n\n"
+                    f"📦 Size: <code>{fmt_size(file_size)}</code>\n\n"
+                    f"{POWERED_BY}"
+                )
+                edit_buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Subscribe Our Community", url="https://t.me/SPEED_AI_COMMUNITY")],
+                    [InlineKeyboardButton("👨‍💻 Creator: @SPEED_prime", url="https://t.me/SPEED_prime")],
+                ])
+                with open(output_path, "rb") as fh:
+                    if file_size <= 50_000_000:
+                        await bot.send_video(chat_id=chat_id, video=fh,
+                            caption=caption, parse_mode=ParseMode.HTML,
+                            reply_markup=edit_buttons,
+                            read_timeout=1200, write_timeout=1200)
+                    else:
+                        await bot.send_document(chat_id=chat_id, document=fh,
+                            filename=output_path.name, caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=edit_buttons,
+                            read_timeout=1200, write_timeout=1200)
+                await safe_edit(status_msg, f"✅ <b>Edit complete!</b>\n\n{POWERED_BY}")
+            else:
+                await safe_edit(status_msg, f"❌ Processing failed. No output file.\n\n{POWERED_BY}")
+
+    except Exception as e:
+        log.error(f"Edit error: {traceback.format_exc()}")
+        await safe_edit(status_msg, f"❌ <b>Edit failed:</b> <code>{str(e)[:300]}</code>\n\n{POWERED_BY}")
+    finally:
+        edit_sessions.pop(uid, None)
+        shutil.rmtree(task_dir, ignore_errors=True)
+
+
 # ── Register bot commands in Telegram menu ─────────────────
 async def post_init(application):
     """Register all bot commands in Telegram menu so users see them when typing /"""
@@ -1452,6 +1938,7 @@ async def post_init(application):
         BotCommand("settings", "Customize your download preferences"),
         BotCommand("subs", "Download subtitles from URL"),
         BotCommand("ping", "Check if bot is online"),
+        BotCommand("edit", "Edit videos (reply to a video with /edit)"),
     ]
     await application.bot.set_my_commands(commands)
     log.info("Bot commands registered in Telegram menu.")
@@ -1483,9 +1970,13 @@ def main():
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("subs", cmd_subs))
     app.add_handler(CommandHandler("music", cmd_music))
+    app.add_handler(CommandHandler("edit", cmd_edit))
 
     # Callbacks (buttons)
     app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # Handle video/audio messages for edit sessions
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.ALL, handle_edit_video_message))
 
     # Auto-detect URLs or music search in plain messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
